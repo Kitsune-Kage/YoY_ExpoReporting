@@ -1,0 +1,1030 @@
+Attribute VB_Name = "modGG_WL_YoY_Splitter_v1_1_1"
+Option Explicit
+
+' Splitter v1.1.1 for _NSM YoY Brand Reporting Tool
+' Driver sheet: Items by Broker
+' Output: one .xlsx per brand, one .zip per known broker, and a separate run-log workbook
+
+Private Const SOURCE_SHEET As String = "Items by Broker"
+Private Const LOG_SHEET As String = "YOY_Log"
+Private Const MACRO_VERSION As String = "1.1.1"
+Private Const UNKNOWN_BROKER As String = "_unknown_"
+Private Const RUN_STAMP_FORMAT As String = "yyyy-mm-dd_hhnnss"
+Private mProgress As Object
+Private mCancelRequested As Boolean
+Private mRunStarted As Date
+
+Public Sub Build_YOY_Brand_Files_And_Broker_Zips_v1_1_1()
+    Dim answer As VbMsgBoxResult, exportAsTable As Boolean
+    answer = MsgBox("Run validation only?" & vbCrLf & vbCrLf & _
+                    "Yes: create the run plan and problem log only." & vbCrLf & _
+                    "No: generate brand workbooks and broker ZIPs.", _
+                    vbYesNoCancel + vbQuestion, "YOY Report Splitter v" & MACRO_VERSION)
+    If answer = vbCancel Then Exit Sub
+    If answer = vbYes Then
+        RunYOYSplitter True, False
+        Exit Sub
+    End If
+
+    answer = MsgBox("Convert each exported range into an Excel table?", _
+                    vbYesNoCancel + vbQuestion, "YOY Report Splitter v" & MACRO_VERSION)
+    If answer = vbCancel Then Exit Sub
+    exportAsTable = (answer = vbYes)
+    RunYOYSplitter False, exportAsTable
+End Sub
+
+Public Sub Build_YOY_Validation_Only_v1_1_1()
+    RunYOYSplitter True, False
+End Sub
+
+Public Sub Build_YOY_Standard_v1_1_1()
+    RunYOYSplitter False, False
+End Sub
+
+Public Sub Request_YOY_Cancel_v1_1_1()
+    mCancelRequested = True
+    On Error Resume Next
+    If Not mProgress Is Nothing Then mProgress.Tag = "CANCEL"
+    On Error GoTo 0
+End Sub
+
+Private Sub RunYOYSplitter(ByVal validationOnly As Boolean, ByVal exportAsTable As Boolean)
+    Dim toolWB As Workbook, sourceWS As Worksheet, logWB As Workbook, logWS As Worksheet
+    Dim headers As Object, brands As Object, brokers As Object
+    Dim lastRow As Long, lastCol As Long, rowNum As Long
+    Dim runStamp As String, runStarted As Date, runEnded As Date
+    Dim oldCalc As XlCalculation, oldScreen As Boolean, oldAlerts As Boolean, oldEvents As Boolean
+    Dim detail As Object, settingsCaptured As Boolean
+    Dim requiredHeaders As Variant, missing As String
+    Dim successBrands As Long, failedBrands As Long, successZips As Long, failedZips As Long
+    Dim validationSkippedRows As Long, zipSkippedRows As Long, zippedBrandFiles As Long
+    Dim fatalMessage As String, runFolder As String, deptCode As String, logFilePath As String
+    Dim firstOutputCol As Long, lastOutputCol As Long, saveAnswer As VbMsgBoxResult
+
+    On Error GoTo FatalError
+
+    runStarted = Now
+    mRunStarted = runStarted
+    mCancelRequested = False
+    runStamp = Format$(runStarted, RUN_STAMP_FORMAT)
+
+    Set toolWB = ThisWorkbook
+    Set sourceWS = toolWB.Worksheets(SOURCE_SHEET)
+
+    If Not toolWB.Saved Then
+        saveAnswer = MsgBox("The tool workbook contains unsaved changes." & vbCrLf & vbCrLf & _
+                            "Save it before starting?", vbYesNoCancel + vbExclamation, _
+                            "YOY Report Splitter v" & MACRO_VERSION)
+        If saveAnswer = vbCancel Then Exit Sub
+        If saveAnswer = vbYes Then toolWB.Save
+    End If
+
+    oldScreen = Application.ScreenUpdating
+    oldAlerts = Application.DisplayAlerts
+    oldEvents = Application.EnableEvents
+    oldCalc = Application.Calculation
+    settingsCaptured = True
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    lastRow = LastUsedRow(sourceWS)
+    lastCol = LastUsedColumn(sourceWS)
+    If lastRow < 2 Or lastCol = 0 Then Err.Raise vbObjectError + 100, , _
+        "'" & SOURCE_SHEET & "' does not contain any data rows."
+
+    Set headers = BuildHeaderMap(sourceWS, lastCol)
+    requiredHeaders = Array("dept code", "brand name", "broker name", "destination", "base subfolder", _
+                            "brand folder", "broker folder", "brand filename", "broker zip")
+    missing = MissingHeaders(headers, requiredHeaders)
+    If Len(missing) > 0 Then Err.Raise vbObjectError + 101, , _
+        "Missing required column(s): " & missing
+
+    firstOutputCol = 2
+    lastOutputCol = CLng(headers("destination")) - 1
+    If lastOutputCol < firstOutputCol Then Err.Raise vbObjectError + 103, , _
+        "No report columns were found between Brokerage/Brand and destination."
+
+    ResolveRunContext sourceWS, lastRow, lastCol, headers, runStamp, runFolder, deptCode
+    Set logWS = PrepareLogWorkbook(runFolder, deptCode, runStamp, logWB, logFilePath)
+
+    Set brands = CreateObject("Scripting.Dictionary")
+    brands.CompareMode = vbTextCompare
+    Set brokers = CreateObject("Scripting.Dictionary")
+    brokers.CompareMode = vbTextCompare
+
+    ' Build and validate the run plan before writing any output.
+    For rowNum = 2 To lastRow
+        If RowHasData(sourceWS, rowNum, lastCol) Then
+            ThrowIfCancelled
+            AddRowToPlan sourceWS, rowNum, headers, runStamp, runFolder, deptCode, _
+                         brands, brokers, logWS, validationSkippedRows, zipSkippedRows
+        End If
+    Next rowNum
+
+    If brands.Count = 0 Then Err.Raise vbObjectError + 102, , _
+        "No valid data rows were found on '" & SOURCE_SHEET & "'. See the run log."
+
+    If validationOnly Then GoTo CleanExit
+
+    ShowProgressSafe
+    UpdateProgressSafe 0, "Creating brand files", ""
+
+    ' Phase 1: create every brand workbook.
+    Dim keys As Variant, i As Long, totalSteps As Long, completedSteps As Long
+    keys = brands.Keys
+    totalSteps = brands.Count + brokers.Count
+
+    For i = LBound(keys) To UBound(keys)
+        ThrowIfCancelled
+        Set detail = brands(keys(i))
+        UpdateProgressSafe completedSteps / totalSteps, "Creating brand files", detail("brandName")
+        On Error Resume Next
+        CreateBrandWorkbook sourceWS, firstOutputCol, lastOutputCol, detail, exportAsTable
+        If Err.Number <> 0 Then
+            detail("status") = "ERROR"
+            detail("message") = Err.Description
+            failedBrands = failedBrands + 1
+            WriteLog logWS, RowList(detail("rows")), "Brand", detail("brandName"), detail("brandFile"), _
+                     detail("brokerZip"), "ERROR creating brand file: " & Err.Description
+            Err.Clear
+        Else
+            detail("status") = "SUCCESS"
+            successBrands = successBrands + 1
+            WriteLog logWS, RowList(detail("rows")), "Brand", detail("brandName"), detail("brandFile"), _
+                     detail("brokerZip"), "Success"
+        End If
+        On Error GoTo FatalError
+        completedSteps = completedSteps + 1
+        UpdateProgressSafe completedSteps / totalSteps, "Creating brand files", detail("brandName")
+    Next i
+
+    ' Phase 2: create each broker ZIP from successfully created brand files.
+    keys = brokers.Keys
+    For i = LBound(keys) To UBound(keys)
+        ThrowIfCancelled
+        Set detail = brokers(keys(i))
+        UpdateProgressSafe completedSteps / totalSteps, "Creating broker ZIPs", detail("brokerName")
+        On Error Resume Next
+        CreateBrokerZip detail, brands, zippedBrandFiles
+        If Err.Number <> 0 Then
+            failedZips = failedZips + 1
+            WriteLog logWS, "N/A", "Broker ZIP", detail("brokerName"), "", _
+                     detail("brokerZip"), "ERROR creating ZIP: " & Err.Description
+            Err.Clear
+        Else
+            successZips = successZips + 1
+            WriteLog logWS, "N/A", "Broker ZIP", detail("brokerName"), "", _
+                     detail("brokerZip"), "Success - " & detail("brandCount") & " brand file(s)"
+        End If
+        On Error GoTo FatalError
+        completedSteps = completedSteps + 1
+        UpdateProgressSafe completedSteps / totalSteps, "Creating broker ZIPs", detail("brokerName")
+    Next i
+
+CleanExit:
+    runEnded = Now
+    On Error Resume Next
+    UpdateProgressSafe 1, "Complete", ""
+    CloseProgressSafe
+    WriteRunSummary logWS, runStarted, runEnded, runStamp, DictionaryCount(brands), successBrands, _
+                    failedBrands, DictionaryCount(brokers), successZips, failedZips, validationSkippedRows, _
+                    zipSkippedRows, zippedBrandFiles, deptCode, validationOnly, exportAsTable, fatalMessage
+    SaveAndCloseLogWorkbook logWB, logFilePath
+    If settingsCaptured Then
+        Application.Calculation = oldCalc
+        Application.EnableEvents = oldEvents
+        Application.DisplayAlerts = oldAlerts
+        Application.ScreenUpdating = oldScreen
+    End If
+    On Error GoTo 0
+
+    If Len(fatalMessage) > 0 Then
+        MsgBox "The run stopped: " & fatalMessage & vbCrLf & _
+               "Review the run log for details:" & vbCrLf & logFilePath, vbExclamation, _
+               "YOY Report Splitter v" & MACRO_VERSION
+    ElseIf validationOnly Then
+        MsgBox "Validation completed. No brand files or ZIPs were generated." & vbCrLf & vbCrLf & _
+               "Valid brands planned: " & DictionaryCount(brands) & vbCrLf & _
+               "Rows skipped by validation: " & validationSkippedRows & vbCrLf & _
+               "Run log: " & logFilePath, vbInformation, "YOY Report Splitter v" & MACRO_VERSION
+    Else
+        MsgBox "YOY report processing completed." & vbCrLf & vbCrLf & _
+               "Brand files: " & successBrands & " successful, " & failedBrands & " failed" & vbCrLf & _
+               "Broker ZIPs: " & successZips & " successful, " & failedZips & " failed" & vbCrLf & _
+               "Run timestamp: " & runStamp & vbCrLf & _
+               "Run log: " & logFilePath, vbInformation, "YOY Report Splitter v" & MACRO_VERSION
+    End If
+    Exit Sub
+
+FatalError:
+    fatalMessage = Err.Description
+    If Not logWS Is Nothing Then WriteLog logWS, "N/A", "Run", "", "", "", "FATAL: " & fatalMessage
+    Resume CleanExit
+End Sub
+
+Private Sub ResolveRunContext(ByVal ws As Worksheet, ByVal lastRow As Long, ByVal lastCol As Long, _
+                              ByVal headers As Object, ByVal runStamp As String, _
+                              ByRef runFolder As String, ByRef deptCode As String)
+    Dim rowNum As Long, destination As String, baseFolder As String
+    For rowNum = 2 To lastRow
+        If RowHasData(ws, rowNum, lastCol) Then
+            destination = NormalizeRootPath(CellText(ws, rowNum, headers("destination")))
+            baseFolder = CleanPathPart(CellText(ws, rowNum, headers("base subfolder")), True)
+            deptCode = CleanFilePart(CellText(ws, rowNum, headers("dept code")))
+            If Len(destination) > 0 And Len(baseFolder) > 0 And Len(deptCode) > 0 Then
+                runFolder = JoinPath(destination, baseFolder & "_" & runStamp)
+                EnsureFolderTree runFolder
+                Exit Sub
+            End If
+        End If
+    Next rowNum
+    Err.Raise vbObjectError + 104, "ResolveRunContext", _
+              "No row contains a usable destination, base subfolder, and Dept Code."
+End Sub
+
+Private Sub AddRowToPlan(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal headers As Object, _
+                         ByVal runStamp As String, ByVal expectedRunFolder As String, _
+                         ByVal expectedDeptCode As String, ByVal brands As Object, ByVal brokers As Object, _
+                         ByVal logWS As Worksheet, ByRef validationSkippedRows As Long, _
+                         ByRef zipSkippedRows As Long)
+    Dim brandName As String, brokerName As String, destination As String
+    Dim baseFolder As String, brandFolder As String, brokerFolder As String
+    Dim brandFileName As String, brokerZipName As String
+    Dim runFolder As String, brandPath As String, brokerPath As String
+    Dim brandKey As String, brokerKey As String, d As Object, rows As Collection
+    Dim deptCode As String, unknownBroker As Boolean
+
+    deptCode = CellText(ws, rowNum, headers("dept code"))
+    brandName = CellText(ws, rowNum, headers("brand name"))
+    brokerName = CellText(ws, rowNum, headers("broker name"))
+    destination = NormalizeRootPath(CellText(ws, rowNum, headers("destination")))
+    baseFolder = CleanPathPart(CellText(ws, rowNum, headers("base subfolder")), True)
+    brandFolder = CleanPathPart(CellText(ws, rowNum, headers("brand folder")), True)
+    brokerFolder = CleanPathPart(CellText(ws, rowNum, headers("broker folder")), True)
+    brandFileName = EnsureExtension(CleanFilePart(CellText(ws, rowNum, headers("brand filename"))), ".xlsx")
+    brokerZipName = EnsureExtension(CleanFilePart(CellText(ws, rowNum, headers("broker zip"))), ".zip")
+
+    unknownBroker = IsUnknownBroker(brokerName)
+
+    If Len(deptCode) = 0 Or Len(brandName) = 0 Or Len(brokerName) = 0 Or Len(destination) = 0 Or _
+       Len(baseFolder) = 0 Or Len(brandFolder) = 0 Or Len(brandFileName) = 0 Or _
+       (Not unknownBroker And (Len(brokerFolder) = 0 Or Len(brokerZipName) = 0)) Then
+        validationSkippedRows = validationSkippedRows + 1
+        WriteLog logWS, CStr(rowNum), "Validation", brandName, "", "", _
+                 "Skipped: one or more required values are blank or invalid."
+        Exit Sub
+    End If
+
+    runFolder = JoinPath(destination, baseFolder & "_" & runStamp)
+    brandPath = JoinPath(JoinPath(runFolder, brandFolder), brandFileName)
+    If Not unknownBroker Then brokerPath = JoinPath(JoinPath(runFolder, brokerFolder), brokerZipName)
+
+    If StrComp(runFolder, expectedRunFolder, vbTextCompare) <> 0 Or _
+       StrComp(deptCode, expectedDeptCode, vbTextCompare) <> 0 Then
+        validationSkippedRows = validationSkippedRows + 1
+        WriteLog logWS, CStr(rowNum), "Validation", brandName, brandPath, brokerPath, _
+                 "Skipped: destination/base folder or Dept Code differs from this run."
+        Exit Sub
+    End If
+
+    If Len(brandPath) > 240 Or (Not unknownBroker And Len(brokerPath) > 240) Then
+        validationSkippedRows = validationSkippedRows + 1
+        WriteLog logWS, CStr(rowNum), "Validation", brandName, brandPath, brokerPath, _
+                 "Skipped: output path exceeds 240 characters."
+        Exit Sub
+    End If
+
+    brandKey = LCase$(brandPath)
+    If Not unknownBroker Then brokerKey = LCase$(brokerPath)
+
+    If brands.Exists(brandKey) Then
+        Set d = brands(brandKey)
+        If StrComp(d("brandName"), brandName, vbTextCompare) <> 0 Or _
+           CBool(d("unknownBroker")) <> unknownBroker Or _
+           (Not unknownBroker And StrComp(d("brokerZip"), brokerPath, vbTextCompare) <> 0) Then
+            validationSkippedRows = validationSkippedRows + 1
+            WriteLog logWS, CStr(rowNum), "Validation", brandName, brandPath, brokerPath, _
+                     "Skipped: sanitized brand filename collides with another brand or broker assignment."
+            Exit Sub
+        End If
+        Set rows = d("rows")
+        rows.Add rowNum
+    Else
+        Set d = CreateObject("Scripting.Dictionary")
+        d.CompareMode = vbTextCompare
+        Set rows = New Collection
+        rows.Add rowNum
+        d.Add "brandName", brandName
+        d.Add "brokerName", brokerName
+        d.Add "brandFile", brandPath
+        d.Add "brokerZip", brokerPath
+        d.Add "rows", rows
+        d.Add "status", "PENDING"
+        d.Add "message", ""
+        d.Add "unknownBroker", unknownBroker
+        brands.Add brandKey, d
+    End If
+
+    WriteLog logWS, CStr(rowNum), "Run Plan", brandName, brandPath, _
+             IIf(unknownBroker, "", brokerPath), _
+             IIf(unknownBroker, "Planned brand file; broker ZIP intentionally skipped", "Planned")
+
+    If unknownBroker Then
+        zipSkippedRows = zipSkippedRows + 1
+        Exit Sub
+    End If
+
+    If brokers.Exists(brokerKey) Then
+        Set d = brokers(brokerKey)
+        If StrComp(d("brokerName"), brokerName, vbTextCompare) <> 0 Then
+            WriteLog logWS, CStr(rowNum), "Validation", brandName, brandPath, brokerPath, _
+                     "Broker ZIP filename collision: more than one broker resolves to this ZIP path."
+            d("invalid") = True
+        End If
+    Else
+        Set d = CreateObject("Scripting.Dictionary")
+        d.CompareMode = vbTextCompare
+        d.Add "brokerName", brokerName
+        d.Add "brokerZip", brokerPath
+        d.Add "invalid", False
+        d.Add "brandCount", 0
+        brokers.Add brokerKey, d
+    End If
+End Sub
+
+Private Sub CreateBrandWorkbook(ByVal sourceWS As Worksheet, ByVal firstOutputCol As Long, _
+                                ByVal lastOutputCol As Long, ByVal detail As Object, _
+                                ByVal exportAsTable As Boolean)
+    Dim outWB As Workbook, outWS As Worksheet, rows As Collection
+    Dim i As Long, targetRow As Long, outFolder As String, sourceCol As Long, targetCol As Long
+    Dim outputColCount As Long, exportRange As Range, exportTable As ListObject
+    Dim errorNumber As Long, errorDescription As String
+    On Error GoTo Failed
+
+    outFolder = ParentFolder(detail("brandFile"))
+    EnsureFolderTree outFolder
+
+    Set outWB = Workbooks.Add(xlWBATWorksheet)
+    Set outWS = outWB.Worksheets(1)
+    outWS.Name = Left$(SOURCE_SHEET, 31)
+
+    ' Do not use xlPasteAll or Copy Destination here. Those operations can copy
+    ' worksheet outline metadata and raise error 1004 while Excel attempts to set
+    ' Outline.SummaryRow in the new workbook.
+    outputColCount = lastOutputCol - firstOutputCol + 1
+    CopyCellsWithoutOutline sourceWS.Range(sourceWS.Cells(1, firstOutputCol), _
+                            sourceWS.Cells(1, lastOutputCol)), outWS.Cells(1, 1)
+
+    targetCol = 1
+    For sourceCol = firstOutputCol To lastOutputCol
+        outWS.Columns(targetCol).ColumnWidth = sourceWS.Columns(sourceCol).ColumnWidth
+        outWS.Columns(targetCol).Hidden = sourceWS.Columns(sourceCol).Hidden
+        targetCol = targetCol + 1
+    Next sourceCol
+    outWS.Rows(1).RowHeight = sourceWS.Rows(1).RowHeight
+
+    Set rows = detail("rows")
+    targetRow = 2
+    For i = 1 To rows.Count
+        ThrowIfCancelled
+        CopyCellsWithoutOutline sourceWS.Range(sourceWS.Cells(rows(i), firstOutputCol), _
+                                sourceWS.Cells(rows(i), lastOutputCol)), _
+                                outWS.Cells(targetRow, 1)
+        outWS.Rows(targetRow).RowHeight = sourceWS.Rows(rows(i)).RowHeight
+        targetRow = targetRow + 1
+    Next i
+
+    Application.CutCopyMode = False
+    outWS.Activate
+    outWS.Range("A2").Select
+    ActiveWindow.FreezePanes = True
+    Set exportRange = outWS.Range(outWS.Cells(1, 1), outWS.Cells(targetRow - 1, outputColCount))
+    If exportAsTable Then
+        Set exportTable = outWS.ListObjects.Add(xlSrcRange, exportRange, , xlYes)
+        exportTable.Name = "tblBrandExport"
+        exportTable.TableStyle = "TableStyleMedium2"
+    Else
+        exportRange.AutoFilter
+    End If
+    outWB.SaveAs Filename:=detail("brandFile"), FileFormat:=xlOpenXMLWorkbook, CreateBackup:=False
+    outWB.Close SaveChanges:=False
+    Exit Sub
+
+Failed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    On Error Resume Next
+    If Not outWB Is Nothing Then outWB.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise errorNumber, "CreateBrandWorkbook", errorDescription
+End Sub
+
+Private Sub CopyCellsWithoutOutline(ByVal sourceRange As Range, ByVal targetCell As Range)
+    Dim targetRange As Range, sourceCell As Range, targetFormatCell As Range
+
+    Set targetRange = targetCell.Resize(sourceRange.Rows.Count, sourceRange.Columns.Count)
+
+    ' Never invoke Copy/Paste on the source query table. Besides outline metadata,
+    ' Excel can modify a ListObject's visual state while servicing clipboard copies.
+    ' Values and the relevant cell formats are transferred property by property.
+    targetRange.Value2 = sourceRange.Value2
+    For Each sourceCell In sourceRange.Cells
+        Set targetFormatCell = targetRange.Cells(sourceCell.Row - sourceRange.Row + 1, _
+                                                 sourceCell.Column - sourceRange.Column + 1)
+        With targetFormatCell
+            .NumberFormat = sourceCell.NumberFormat
+            .HorizontalAlignment = sourceCell.HorizontalAlignment
+            .VerticalAlignment = sourceCell.VerticalAlignment
+            .WrapText = sourceCell.WrapText
+            .Orientation = sourceCell.Orientation
+            .IndentLevel = sourceCell.IndentLevel
+            .ShrinkToFit = sourceCell.ShrinkToFit
+            .Font.Name = sourceCell.Font.Name
+            .Font.Size = sourceCell.Font.Size
+            .Font.Bold = sourceCell.Font.Bold
+            .Font.Italic = sourceCell.Font.Italic
+            .Font.Underline = sourceCell.Font.Underline
+            .Font.Color = sourceCell.Font.Color
+            .Interior.Pattern = sourceCell.Interior.Pattern
+            .Interior.Color = sourceCell.Interior.Color
+        End With
+    Next sourceCell
+End Sub
+
+Private Sub CreateBrokerZip(ByVal broker As Object, ByVal brands As Object, _
+                            ByRef totalZippedBrandFiles As Long)
+    Dim zipPath As String, fso As Object, keys As Variant
+    Dim i As Long, brand As Object, added As Long
+    Dim filePaths As Collection, entryNames As Collection
+    Dim errorNumber As Long, errorDescription As String
+    On Error GoTo Failed
+
+    If CBool(broker("invalid")) Then Err.Raise vbObjectError + 207, , _
+        "ZIP plan is invalid because more than one broker resolves to this ZIP path."
+
+    zipPath = broker("brokerZip")
+    EnsureFolderTree ParentFolder(zipPath)
+    If Len(Dir$(zipPath)) > 0 Then Err.Raise vbObjectError + 200, , _
+        "ZIP already exists unexpectedly: " & zipPath
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set filePaths = New Collection
+    Set entryNames = New Collection
+
+    keys = brands.Keys
+    For i = LBound(keys) To UBound(keys)
+        Set brand = brands(keys(i))
+        If StrComp(brand("brokerZip"), zipPath, vbTextCompare) = 0 And brand("status") = "SUCCESS" Then
+            If Not fso.FileExists(brand("brandFile")) Then Err.Raise vbObjectError + 201, , _
+                "Brand file not found: " & brand("brandFile")
+            filePaths.Add CStr(brand("brandFile"))
+            entryNames.Add fso.GetFileName(CStr(brand("brandFile")))
+            added = added + 1
+        End If
+    Next i
+
+    If added = 0 Then Err.Raise vbObjectError + 202, , _
+        "No successful brand files were available for this broker."
+
+    broker("brandCount") = added
+
+    ' Write a standards-compliant ZIP directly in VBA. Entries use ZIP method 0
+    ' (stored/no compression), avoiding PowerShell, command shells, and Explorer's
+    ' unreliable ZIP Namespace interface.
+    WriteStoredZip zipPath, filePaths, entryNames
+    If Not fso.FileExists(zipPath) Then Err.Raise vbObjectError + 204, , _
+        "VBA completed but no ZIP was created: " & zipPath
+    If fso.GetFile(zipPath).Size <= 22 Then Err.Raise vbObjectError + 205, , _
+        "ZIP was created but contains no brand files: " & zipPath
+    If Not VerifyStoredZip(zipPath, added) Then Err.Raise vbObjectError + 206, , _
+        "ZIP verification failed: " & zipPath
+    totalZippedBrandFiles = totalZippedBrandFiles + added
+    Exit Sub
+
+Failed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    On Error Resume Next
+    If Len(zipPath) > 0 And Len(Dir$(zipPath)) > 0 Then Kill zipPath
+    On Error GoTo 0
+    Err.Raise errorNumber, "CreateBrokerZip", errorDescription
+End Sub
+
+Private Sub WriteStoredZip(ByVal zipPath As String, ByVal filePaths As Collection, _
+                           ByVal entryNames As Collection)
+    Dim zipFile As Integer, sourceFile As Integer, i As Long
+    Dim entryCount As Long, fileSize As Long, crc As Long
+    Dim dosDate As Long, dosTime As Long, localOffset As Double
+    Dim centralStart As Double, centralSize As Double
+    Dim nameBytes() As Byte, dataBytes() As Byte
+    Dim offsets() As Double, sizes() As Long, crcs() As Long
+    Dim dates() As Long, times() As Long, names() As String
+    Dim fso As Object, modified As Date
+    Dim errorNumber As Long, errorDescription As String
+    On Error GoTo Failed
+
+    entryCount = filePaths.Count
+    ReDim offsets(1 To entryCount)
+    ReDim sizes(1 To entryCount)
+    ReDim crcs(1 To entryCount)
+    ReDim dates(1 To entryCount)
+    ReDim times(1 To entryCount)
+    ReDim names(1 To entryCount)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    zipFile = FreeFile
+    Open zipPath For Binary Access Write As #zipFile
+
+    For i = 1 To entryCount
+        ThrowIfCancelled
+        names(i) = CStr(entryNames(i))
+        nameBytes = StrConv(names(i), vbFromUnicode)
+        sourceFile = FreeFile
+        Open CStr(filePaths(i)) For Binary Access Read As #sourceFile
+        fileSize = LOF(sourceFile)
+        If fileSize > 0 Then
+            ReDim dataBytes(0 To fileSize - 1)
+            Get #sourceFile, 1, dataBytes
+        Else
+            ReDim dataBytes(0 To 0)
+        End If
+        Close #sourceFile
+        sourceFile = 0
+
+        crc = CRC32Bytes(dataBytes, fileSize)
+        modified = fso.GetFile(CStr(filePaths(i))).DateLastModified
+        ToDosDateTime modified, dosDate, dosTime
+        localOffset = LOF(zipFile)
+
+        WriteUInt32 zipFile, CDbl(&H4034B50)
+        WriteUInt16 zipFile, 20
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, dosTime
+        WriteUInt16 zipFile, dosDate
+        WriteUInt32 zipFile, UnsignedLong(crc)
+        WriteUInt32 zipFile, fileSize
+        WriteUInt32 zipFile, fileSize
+        WriteUInt16 zipFile, ByteArrayLength(nameBytes)
+        WriteUInt16 zipFile, 0
+        Put #zipFile, , nameBytes
+        If fileSize > 0 Then Put #zipFile, , dataBytes
+
+        offsets(i) = localOffset
+        sizes(i) = fileSize
+        crcs(i) = crc
+        dates(i) = dosDate
+        times(i) = dosTime
+    Next i
+
+    centralStart = LOF(zipFile)
+    For i = 1 To entryCount
+        ThrowIfCancelled
+        nameBytes = StrConv(names(i), vbFromUnicode)
+        WriteUInt32 zipFile, CDbl(&H2014B50)
+        WriteUInt16 zipFile, 20
+        WriteUInt16 zipFile, 20
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, times(i)
+        WriteUInt16 zipFile, dates(i)
+        WriteUInt32 zipFile, UnsignedLong(crcs(i))
+        WriteUInt32 zipFile, sizes(i)
+        WriteUInt32 zipFile, sizes(i)
+        WriteUInt16 zipFile, ByteArrayLength(nameBytes)
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, 0
+        WriteUInt16 zipFile, 0
+        WriteUInt32 zipFile, 0
+        WriteUInt32 zipFile, offsets(i)
+        Put #zipFile, , nameBytes
+    Next i
+    centralSize = LOF(zipFile) - centralStart
+
+    WriteUInt32 zipFile, CDbl(&H6054B50)
+    WriteUInt16 zipFile, 0
+    WriteUInt16 zipFile, 0
+    WriteUInt16 zipFile, entryCount
+    WriteUInt16 zipFile, entryCount
+    WriteUInt32 zipFile, centralSize
+    WriteUInt32 zipFile, centralStart
+    WriteUInt16 zipFile, 0
+    Close #zipFile
+    Exit Sub
+
+Failed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    On Error Resume Next
+    If sourceFile <> 0 Then Close #sourceFile
+    If zipFile <> 0 Then Close #zipFile
+    On Error GoTo 0
+    Err.Raise errorNumber, "WriteStoredZip", errorDescription
+End Sub
+
+Private Function CRC32Bytes(ByRef bytes() As Byte, ByVal byteCount As Long) As Long
+    Dim crc As Long, i As Long, bit As Long
+    crc = &HFFFFFFFF
+    For i = 0 To byteCount - 1
+        crc = crc Xor CLng(bytes(i))
+        For bit = 1 To 8
+            If (crc And 1) <> 0 Then
+                crc = UnsignedRightShiftOne(crc) Xor &HEDB88320
+            Else
+                crc = UnsignedRightShiftOne(crc)
+            End If
+        Next bit
+    Next i
+    CRC32Bytes = crc Xor &HFFFFFFFF
+End Function
+
+Private Function UnsignedRightShiftOne(ByVal value As Long) As Long
+    UnsignedRightShiftOne = (value And &H7FFFFFFF) \ 2
+    If value < 0 Then UnsignedRightShiftOne = UnsignedRightShiftOne Or &H40000000
+End Function
+
+Private Function UnsignedLong(ByVal value As Long) As Double
+    If value < 0 Then
+        UnsignedLong = 4294967296# + CDbl(value)
+    Else
+        UnsignedLong = CDbl(value)
+    End If
+End Function
+
+Private Sub WriteUInt16(ByVal fileNum As Integer, ByVal value As Long)
+    Dim bytes(0 To 1) As Byte
+    bytes(0) = value And &HFF&
+    bytes(1) = (value \ 256) And &HFF&
+    Put #fileNum, , bytes
+End Sub
+
+Private Sub WriteUInt32(ByVal fileNum As Integer, ByVal value As Double)
+    Dim bytes(0 To 3) As Byte, part As Double, i As Long
+    part = value
+    For i = 0 To 3
+        bytes(i) = CByte(part - 256# * Int(part / 256#))
+        part = Int(part / 256#)
+    Next i
+    Put #fileNum, , bytes
+End Sub
+
+Private Function ByteArrayLength(ByRef bytes() As Byte) As Long
+    ByteArrayLength = UBound(bytes) - LBound(bytes) + 1
+End Function
+
+Private Sub ToDosDateTime(ByVal value As Date, ByRef dosDate As Long, ByRef dosTime As Long)
+    Dim safeYear As Long
+    safeYear = Year(value)
+    If safeYear < 1980 Then safeYear = 1980
+    dosDate = ((safeYear - 1980) * 512) Or (Month(value) * 32) Or Day(value)
+    dosTime = (Hour(value) * 2048) Or (Minute(value) * 32) Or (Second(value) \ 2)
+End Sub
+
+Private Function VerifyStoredZip(ByVal zipPath As String, ByVal expectedEntries As Long) As Boolean
+    Dim fileNum As Integer, fileSize As Long, tail(0 To 21) As Byte
+    On Error GoTo Failed
+    fileNum = FreeFile
+    Open zipPath For Binary Access Read As #fileNum
+    fileSize = LOF(fileNum)
+    If fileSize < 22 Then GoTo Failed
+    Get #fileNum, fileSize - 21, tail
+    Close #fileNum
+    fileNum = 0
+    If tail(0) <> &H50 Or tail(1) <> &H4B Or tail(2) <> &H5 Or tail(3) <> &H6 Then Exit Function
+    If CLng(tail(10)) + CLng(tail(11)) * 256 <> expectedEntries Then Exit Function
+    VerifyStoredZip = True
+    Exit Function
+Failed:
+    On Error Resume Next
+    If fileNum <> 0 Then Close #fileNum
+End Function
+
+Private Function BuildHeaderMap(ByVal ws As Worksheet, ByVal lastCol As Long) As Object
+    Dim map As Object, col As Long, key As String
+    Set map = CreateObject("Scripting.Dictionary")
+    map.CompareMode = vbTextCompare
+    For col = 1 To lastCol
+        key = NormalizeHeader(CStr(ws.Cells(1, col).Value2))
+        If Len(key) > 0 Then map(key) = col
+    Next col
+
+    ' Accept common existing labels while making the new names canonical.
+    AliasHeader map, "dept code", Array("department code", "dept", "department")
+    AliasHeader map, "brand name", Array("brand", "brandname")
+    AliasHeader map, "broker name", Array("broker", "brokerage", "brokerage/brand", "brokerage brand")
+    Set BuildHeaderMap = map
+End Function
+
+Private Sub AliasHeader(ByVal map As Object, ByVal canonical As String, ByVal alternatives As Variant)
+    Dim item As Variant
+    If map.Exists(canonical) Then Exit Sub
+    For Each item In alternatives
+        If map.Exists(NormalizeHeader(CStr(item))) Then
+            map.Add canonical, map(NormalizeHeader(CStr(item)))
+            Exit Sub
+        End If
+    Next item
+End Sub
+
+Private Function MissingHeaders(ByVal headers As Object, ByVal required As Variant) As String
+    Dim item As Variant, result As String
+    For Each item In required
+        If Not headers.Exists(CStr(item)) Then
+            If Len(result) > 0 Then result = result & ", "
+            result = result & CStr(item)
+        End If
+    Next item
+    MissingHeaders = result
+End Function
+
+Private Function NormalizeHeader(ByVal value As String) As String
+    value = Replace(value, vbCr, " ")
+    value = Replace(value, vbLf, " ")
+    value = Replace(value, "_", " ")
+    value = LCase$(Trim$(value))
+    Do While InStr(value, "  ") > 0
+        value = Replace(value, "  ", " ")
+    Loop
+    NormalizeHeader = value
+End Function
+
+Private Function CleanFilePart(ByVal value As String) As String
+    Dim invalid As Variant, item As Variant, i As Long
+    invalid = Array("<", ">", ":", Chr$(34), "/", "\", "|", "?", "*")
+    value = Trim$(value)
+    For Each item In invalid
+        value = Replace(value, CStr(item), "_")
+    Next item
+    For i = 0 To 31
+        value = Replace(value, Chr$(i), "")
+    Next i
+    Do While Len(value) > 0 And (Right$(value, 1) = " " Or Right$(value, 1) = ".")
+        value = Left$(value, Len(value) - 1)
+    Loop
+    If IsReservedWindowsName(value) Then value = "_" & value
+    CleanFilePart = value
+End Function
+
+Private Function CleanPathPart(ByVal value As String, ByVal stripOuterSlashes As Boolean) As String
+    value = Trim$(value)
+    If stripOuterSlashes Then
+        Do While Left$(value, 1) = "\" Or Left$(value, 1) = "/"
+            value = Mid$(value, 2)
+            If Len(value) = 0 Then Exit Do
+        Loop
+        Do While Len(value) > 0 And (Right$(value, 1) = "\" Or Right$(value, 1) = "/")
+            value = Left$(value, Len(value) - 1)
+        Loop
+    End If
+    CleanPathPart = CleanFilePart(value)
+End Function
+
+Private Function IsReservedWindowsName(ByVal value As String) As Boolean
+    Dim stem As String, n As Long
+    stem = UCase$(value)
+    If InStr(stem, ".") > 0 Then stem = Left$(stem, InStr(stem, ".") - 1)
+    If stem = "CON" Or stem = "PRN" Or stem = "AUX" Or stem = "NUL" Then
+        IsReservedWindowsName = True
+        Exit Function
+    End If
+    For n = 1 To 9
+        If stem = "COM" & n Or stem = "LPT" & n Then
+            IsReservedWindowsName = True
+            Exit Function
+        End If
+    Next n
+End Function
+
+Private Function EnsureExtension(ByVal value As String, ByVal extension As String) As String
+    If Len(value) = 0 Then Exit Function
+    If LCase$(Right$(value, Len(extension))) <> LCase$(extension) Then value = value & extension
+    EnsureExtension = value
+End Function
+
+Private Function NormalizeRootPath(ByVal value As String) As String
+    value = Trim$(Replace(value, "/", "\"))
+    Do While Len(value) > 3 And Right$(value, 1) = "\"
+        value = Left$(value, Len(value) - 1)
+    Loop
+    NormalizeRootPath = value
+End Function
+
+Private Function JoinPath(ByVal leftPart As String, ByVal rightPart As String) As String
+    If Right$(leftPart, 1) = "\" Then leftPart = Left$(leftPart, Len(leftPart) - 1)
+    If Left$(rightPart, 1) = "\" Then rightPart = Mid$(rightPart, 2)
+    JoinPath = leftPart & "\" & rightPart
+End Function
+
+Private Function ParentFolder(ByVal fullPath As String) As String
+    ParentFolder = Left$(fullPath, InStrRev(fullPath, "\") - 1)
+End Function
+
+Private Sub EnsureFolderTree(ByVal folderPath As String)
+    Dim fso As Object, parent As String
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FolderExists(folderPath) Then Exit Sub
+    parent = fso.GetParentFolderName(folderPath)
+    If Len(parent) > 0 And Not fso.FolderExists(parent) Then EnsureFolderTree parent
+    fso.CreateFolder folderPath
+End Sub
+
+Private Function PrepareLogWorkbook(ByVal runFolder As String, ByVal deptCode As String, _
+                                    ByVal runStamp As String, ByRef logWB As Workbook, _
+                                    ByRef logFilePath As String) As Worksheet
+    Dim ws As Worksheet, proposedName As String, suffix As Long, suffixText As String
+
+    proposedName = MakeLogName(deptCode, runStamp)
+    logFilePath = JoinPath(runFolder, proposedName & ".xlsx")
+    Do While Len(Dir$(logFilePath)) > 0
+        suffix = suffix + 1
+        suffixText = "_" & CStr(suffix)
+        proposedName = Left$(MakeLogName(deptCode, runStamp), 31 - Len(suffixText)) & suffixText
+        logFilePath = JoinPath(runFolder, proposedName & ".xlsx")
+    Loop
+
+    Set logWB = Workbooks.Add(xlWBATWorksheet)
+    Set ws = logWB.Worksheets(1)
+    ws.Name = proposedName
+    AssertSafeLogTarget ws
+
+    ' Summary stays in A:B, C is a divider, and details begin in D.
+    ws.Range("D1:J1").Value = Array("Source Row(s)", "Type", "Name", "Brand File", _
+                                    "Broker ZIP", "Status", "Timestamp")
+    ws.Range("D1:J1").Font.Bold = True
+    logWB.SaveAs Filename:=logFilePath, FileFormat:=xlOpenXMLWorkbook, CreateBackup:=False
+    Set PrepareLogWorkbook = ws
+End Function
+
+Private Function MakeLogName(ByVal deptCode As String, ByVal runStamp As String) As String
+    Dim safeDept As String, maxDeptLength As Long
+    safeDept = CleanFilePart(deptCode)
+    safeDept = Replace(safeDept, "'", "_")
+    maxDeptLength = 31 - Len(LOG_SHEET) - Len(runStamp) - 2
+    If maxDeptLength < 1 Then maxDeptLength = 1
+    safeDept = Left$(safeDept, maxDeptLength)
+    MakeLogName = Left$(LOG_SHEET & "_" & safeDept & "_" & runStamp, 31)
+End Function
+
+Private Sub AssertSafeLogTarget(ByVal ws As Worksheet)
+    If ws Is Nothing Then Err.Raise vbObjectError + 301, "AssertSafeLogTarget", _
+        "The run-log worksheet is not available."
+    If ws.Parent Is ThisWorkbook Then Err.Raise vbObjectError + 302, "AssertSafeLogTarget", _
+        "Safety check refused to place the run log in the reporting tool workbook."
+    If StrComp(ws.Name, SOURCE_SHEET, vbTextCompare) = 0 Or _
+       LCase$(Left$(ws.Name, Len(LOG_SHEET & "_"))) <> LCase$(LOG_SHEET & "_") Then
+        Err.Raise vbObjectError + 303, "AssertSafeLogTarget", _
+                  "Safety check refused to write because the target is not a dedicated YOY_Log sheet."
+    End If
+End Sub
+
+Private Sub WriteLog(ByVal ws As Worksheet, ByVal sourceRows As String, _
+                     ByVal itemType As String, ByVal itemName As String, _
+                     ByVal brandFile As String, ByVal brokerZip As String, ByVal status As String)
+    Dim nextRow As Long
+    AssertSafeLogTarget ws
+    nextRow = ws.Cells(ws.Rows.Count, 4).End(xlUp).Row + 1
+    ws.Cells(nextRow, 4).Resize(1, 7).Value = Array(sourceRows, itemType, itemName, brandFile, _
+                                                    brokerZip, status, Now)
+End Sub
+
+Private Sub WriteRunSummary(ByVal ws As Worksheet, ByVal started As Date, ByVal ended As Date, _
+                            ByVal runStamp As String, ByVal brandTotal As Long, ByVal brandOK As Long, _
+                            ByVal brandFailed As Long, ByVal zipTotal As Long, ByVal zipOK As Long, _
+                            ByVal zipFailed As Long, ByVal validationSkippedRows As Long, _
+                            ByVal zipSkippedRows As Long, ByVal zippedBrandFiles As Long, _
+                            ByVal deptCode As String, ByVal validationOnly As Boolean, _
+                            ByVal exportAsTable As Boolean, ByVal fatalMessage As String)
+    Dim labels As Variant, values As Variant, i As Long
+    If ws Is Nothing Then Exit Sub
+    AssertSafeLogTarget ws
+    labels = Array("Macro version", "Dept Code", "Mode", "Run timestamp", "Start", "End", _
+                   "Duration", "Validation-skipped rows", "Brands planned", "Brand success", _
+                   "Brand failed", "ZIPs planned", "ZIP success", "ZIP failed", _
+                   "Rows skipped from ZIP (_unknown_)", "Brand files placed in ZIPs", _
+                   "Exported as Excel tables", "Fatal error")
+    values = Array(MACRO_VERSION, deptCode, IIf(validationOnly, "Validation only", "Generate files"), _
+                   runStamp, started, ended, Format$(ended - started, "hh:mm:ss"), _
+                   validationSkippedRows, brandTotal, brandOK, brandFailed, zipTotal, zipOK, _
+                   zipFailed, zipSkippedRows, zippedBrandFiles, IIf(exportAsTable, "Yes", "No"), _
+                   fatalMessage)
+    With ws
+        .Range("A1:B1").Value = Array("RUN SUMMARY", "")
+        For i = LBound(labels) To UBound(labels)
+            .Cells(i + 2, 1).Value = labels(i)
+            .Cells(i + 2, 2).Value = values(i)
+        Next i
+        .Range(.Cells(1, 1), .Cells(UBound(labels) + 2, 1)).Font.Bold = True
+        .Columns("B").NumberFormat = "General"
+        .Cells(6, 2).NumberFormat = "yyyy-mm-dd hh:mm:ss"
+        .Cells(7, 2).NumberFormat = "yyyy-mm-dd hh:mm:ss"
+        .Columns("A:B").AutoFit
+        .Columns("D:J").AutoFit
+    End With
+End Sub
+
+Private Sub SaveAndCloseLogWorkbook(ByVal logWB As Workbook, ByVal logFilePath As String)
+    If logWB Is Nothing Then Exit Sub
+    logWB.Save
+    logWB.Close SaveChanges:=False
+End Sub
+
+Private Function RowList(ByVal rows As Collection) As String
+    Dim i As Long, result As String
+    For i = 1 To rows.Count
+        If Len(result) > 0 Then result = result & ", "
+        result = result & CStr(rows(i))
+    Next i
+    RowList = result
+End Function
+
+Private Function DictionaryCount(ByVal dictionary As Object) As Long
+    If dictionary Is Nothing Then Exit Function
+    DictionaryCount = dictionary.Count
+End Function
+
+Private Function IsUnknownBroker(ByVal brokerName As String) As Boolean
+    Dim marker As String
+    marker = LCase$(Trim$(brokerName))
+    marker = Replace(marker, "_", "")
+    marker = Replace(marker, "*", "")
+    marker = Replace(marker, " ", "")
+    IsUnknownBroker = (marker = "unknown")
+End Function
+
+Private Function LastUsedRow(ByVal ws As Worksheet) As Long
+    Dim cell As Range
+    Set cell = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, _
+                             LookAt:=xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious)
+    If Not cell Is Nothing Then LastUsedRow = cell.Row
+End Function
+
+Private Function LastUsedColumn(ByVal ws As Worksheet) As Long
+    Dim cell As Range
+    Set cell = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, _
+                             LookAt:=xlPart, SearchOrder:=xlByColumns, SearchDirection:=xlPrevious)
+    If Not cell Is Nothing Then LastUsedColumn = cell.Column
+End Function
+
+Private Function RowHasData(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal lastCol As Long) As Boolean
+    RowHasData = (Application.CountA(ws.Range(ws.Cells(rowNum, 1), ws.Cells(rowNum, lastCol))) > 0)
+End Function
+
+Private Function CellText(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal colNum As Long) As String
+    If IsError(ws.Cells(rowNum, colNum).Value) Then Exit Function
+    CellText = Trim$(CStr(ws.Cells(rowNum, colNum).Value2))
+End Function
+
+' Uses the existing ProgressBar form when present, without creating a compile-time dependency.
+Private Sub ShowProgressSafe()
+    On Error Resume Next
+    Set mProgress = VBA.UserForms.Add("ProgressBar")
+    If Not mProgress Is Nothing Then
+        mProgress.Tag = ""
+        mProgress.Show vbModeless
+    End If
+    On Error GoTo 0
+End Sub
+
+Private Sub UpdateProgressSafe(ByVal pct As Double, ByVal stage As String, ByVal currentName As String)
+    Dim elapsedText As String, captionText As String
+    On Error Resume Next
+    DoEvents
+    If Not mProgress Is Nothing Then
+        If UCase$(CStr(mProgress.Tag)) = "CANCEL" Then mCancelRequested = True
+    End If
+    If mProgress Is Nothing Then Exit Sub
+    If pct < 0 Then pct = 0
+    If pct > 1 Then pct = 1
+    elapsedText = Format$(Now - mRunStarted, "hh:mm:ss")
+    captionText = Format$(pct, "0%") & " Complete - " & stage
+    If Len(currentName) > 0 Then captionText = captionText & " - " & currentName
+    captionText = captionText & " - Elapsed " & elapsedText
+    mProgress.Controls("lblBarFill").Width = mProgress.Controls("FrameBarBackground").Width * pct
+    mProgress.Controls("lblPercent").Caption = captionText
+    mProgress.Controls("lblElapsed").Caption = "Elapsed: " & elapsedText
+    mProgress.Controls("lblCurrent").Caption = currentName
+    mProgress.Repaint
+    DoEvents
+    On Error GoTo 0
+End Sub
+
+Private Sub ThrowIfCancelled()
+    DoEvents
+    On Error Resume Next
+    If Not mProgress Is Nothing Then
+        If UCase$(CStr(mProgress.Tag)) = "CANCEL" Then mCancelRequested = True
+    End If
+    On Error GoTo 0
+    If mCancelRequested Then Err.Raise vbObjectError + 320, "YOY Report Splitter", _
+        "Run cancelled by user."
+End Sub
+
+Private Sub CloseProgressSafe()
+    On Error Resume Next
+    If Not mProgress Is Nothing Then Unload mProgress
+    Set mProgress = Nothing
+    On Error GoTo 0
+End Sub
